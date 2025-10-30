@@ -1,0 +1,158 @@
+import json
+import os
+from datetime import datetime
+from typing import Dict, Any
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_gigachat.chat_models import GigaChat
+from langchain.agents import create_react_agent # Импортируем create_react_agent
+
+# --- Конфигурация ---
+GIGACHAT_TOKEN = os.getenv("GIGACHAT_TOKEN", "your_token_here")
+DB_PATH = "templates_db.json"  # База данных в формате JSON
+
+# --- Инициализация LLM ---
+llm = GigaChat(
+    credentials=GIGACHAT_TOKEN,
+    verify_ssl_certs=False,
+    model="GigaChat-Pro",
+    temperature=0.3  # Для более предсказуемого вывода
+)
+
+# --- Определение инструмента ---
+@tool
+def save_template_to_db_tool(template_json_str: str) -> str:
+    """
+    Сохраняет шаблон документации в key-value базу данных.
+    Аргумент 'template_json_str' - это строка в формате JSON, представляющая шаблон.
+    Возвращает ID сохраненного шаблона или сообщение об ошибке.
+    """
+    try:
+        # Парсим строку JSON в словарь
+        template_data = json.loads(template_json_str)
+
+        # Проверяем обязательные поля (опционально, но рекомендуется)
+        required_keys = {"title", "description", "requirements", "validation_rules", "tags"}
+        if not all(key in template_data for key in required_keys):
+            return f"Ошибка: Отсутствуют обязательные поля в шаблоне. Ожидались: {required_keys}"
+
+        if not os.path.exists(DB_PATH):
+            with open(DB_PATH, 'w', encoding='utf-8') as f:
+                json.dump({}, f, indent=2, ensure_ascii=False)
+
+        with open(DB_PATH, 'r', encoding='utf-8') as f:
+            db = json.load(f)
+
+        # Генерируем ID: timestamp + hash
+        template_id = f"tpl_{int(datetime.now().timestamp())}"
+        template_data["id"] = template_id
+        template_data["created_at"] = datetime.now().isoformat()
+        db[template_id] = template_data
+
+        with open(DB_PATH, 'w', encoding='utf-8') as f:
+            json.dump(db, f, indent=2, ensure_ascii=False)
+
+        return template_id
+    except json.JSONDecodeError as e:
+        return f"Ошибка парсинга JSON: {e}"
+    except Exception as e:
+        return f"Ошибка при сохранении в БД: {e}"
+
+tools = [save_template_to_db_tool]
+
+# --- Создание промпта для агента ReAct ---
+# Этот промпт объясняет агенту его роль и как использовать инструменты.
+system_message = """
+Ты — профессиональный технический писатель и агент по созданию шаблонов документации.
+Твоя задача — преобразовать неформальный запрос пользователя в структурированное техническое задание (ТЗ) или шаблон документации в формате JSON.
+Ты должен использовать инструмент `save_template_to_db_tool`, чтобы сохранить сгенерированный шаблон в базу данных.
+Формат JSON должен содержать следующие поля:
+- "title": краткое название ТЗ
+- "description": детальное описание функциональности
+- "requirements": список требований (массив строк)
+- "validation_rules": правила валидации (массив строк)
+- "tags": массив меток (например: ["UI", "API", "Validation"])
+
+Пример:
+{
+  "title": "Изменение цвета кнопки 'Отправить'",
+  "description": "При нажатии на кнопку необходимо валидировать поле 'Email'. Если поле пустое, показать тост-уведомление.",
+  "requirements": [
+    "Кнопка должна менять цвет с серого на синий",
+    "Поле Email должно быть обязательным",
+    "Показывать уведомление при пустом поле"
+  ],
+  "validation_rules": [
+    "Если email == '', то показать 'Поле не может быть пустым'"
+  ],
+  "tags": ["UI", "Validation"]
+}
+
+Ты можешь использовать инструмент `save_template_to_db_tool`, передав ему строку JSON шаблона.
+"""
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", system_message),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+# --- Создание агента ---
+agent = create_react_agent(llm, tools, prompt)
+
+# --- Основная функция агента ---
+def create_agent(user_input: str) -> Dict[str, Any]:
+    """
+    Агент, который создаёт шаблон из неформального запроса, использует инструменты для сохранения и возвращает результат.
+    Возвращает словарь с ID и содержимым шаблона.
+    """
+    try:
+        # Подготовка контекста для агента
+        agent_context = {
+            "input": user_input,
+            "agent_scratchpad": []
+        }
+
+        # Запуск агента
+        result = agent.invoke(agent_context)
+        print("[DEBUG] Agent result:", result)
+
+
+        final_output = result.get('output', '')
+        print("[DEBUG] Agent final output:", final_output)
+
+        if final_output.startswith('tpl_'):
+             template_id = final_output
+             return {
+                 "success": True,
+                 "template_id": template_id,
+                 "template": "Template saved successfully. ID: " + template_id # Возвращаем сообщение, так как JSON не доступен напрямую
+             }
+        else:
+             intermediate_steps = result.get('intermediate_steps', [])
+             for action, observation in intermediate_steps:
+                 if action.tool == "save_template_to_db_tool" and observation.startswith('tpl_'):
+                     template_id = observation
+                     return {
+                         "success": True,
+                         "template_id": template_id,
+                         "template": "Template saved successfully. ID: " + template_id
+                     }
+
+        # Если ID не найден
+        return {
+            "success": False,
+            "error": f"Агент не смог сохранить шаблон или вернуть ID. Финальный вывод: {final_output}",
+            "template_id": None,
+            "template": None
+        }
+
+    except Exception as e:
+        print(f"[ERROR] Exception in create_agent: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "template_id": None,
+            "template": None
+        }
