@@ -1,225 +1,140 @@
-
-from dotenv import load_dotenv
 import os
-from langchain_gigachat.chat_models import GigaChat
-from langgraph.prebuilt import create_react_agent
-from langgraph_supervisor import create_supervisor
-from langchain_perplexity import ChatPerplexity
+import dotenv
+import uuid
+import json
+from langchain_openai import ChatOpenAI
+import re
+import traceback
 
-##инициализация
-load_dotenv()
+from src.agents.create_api_agent import create_api_agent
+from src.agents.extraction_agent import create_extraction_agent
+from src.agents.supervisor import create_supervisor
+from src.agents.technical_task_agent import technical_task_agent_prompt, create_technical_task
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain_community.tools import DuckDuckGoSearchRun
+from langgraph.checkpoint.memory import InMemorySaver
 
-llm_giga = GigaChat(
-    credentials=os.getenv("GIGA_CREDENTIALS"),
-    verify_ssl_certs=False,
+dotenv.load_dotenv()
+client = ChatOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("API_KEY_GPT"),
+    model="openai/gpt-4o"
 )
-llm_perplexity = ChatPerplexity(temperature=0, pplx_api_key=os.getenv("PPLX_API_KEY"), model="sonar")
+########
+technical_task_agent = create_technical_task(model=client)
 
-supervisor_prompt = (
-    "Ты — супервизор-агент."
-    "Твоя роль: управлять исполнением задач, полученных от пользователя. Сам ты никаких задач не решаешь и никакую работу не выполняешь." 
-    "Алгоритм работы:"  
-    "1. Получи задачу от пользователя."  
-    "2. Определи, какие подзадачи нужно выполнить:"  
-    "    - Если задача связана с формулировкой требований, созданием ТЗ или детализацией запроса пользователя → передай её агенту technical_task_agent." 
-    "- Если задача связана с кодом, API или необходимостью оформить документацию по данному коду → передай её агенту create_api_agent.  "
-    "3. Тебе нужно только распределять задачи и пересылать их соответствующему агенту."  
-    "4. Если задача включает обе области сразу, разбей её на 2 подзадачи и направь каждую в нужного агента."  
-    "5. Всегда возвращай пользователю агрегированный результат работы агентов в структурированном виде."
-    "Запомни:"  
-    "- Ты не выполняешь работу сам."  
-    "- Ты отвечаешь только за маршрутизацию и декомпозицию задач.")
+@tool
+def call_technical_task_agent(request: str) -> str:
+    """создает техническое задание по запросу пользователя"""# <-обязательно ,пояснение что делает инструмент, именно в таком формате
+    result = technical_task_agent.invoke({
+        "messages": [{"role": "user", "content": request}]
+    })
+    return result["messages"][-1].content
+############
 
-api_prompt = ()
+api_agent = create_api_agent(model=client)
+@tool
+def call_api_agent(request : str) -> str:
+    """создает апи по запросу пользователя""" #<-обязательно ,пояснение что делает инструмент, именно в таком формате
+    result = api_agent.invoke({
+        "messages": [{"role": "user", "content": request}]});
+    return result["messages"][-1].text
+#########
 
+parse_agent = create_agent(model=client)
+@tool
+def call_parse_agent(request : str) -> str:
+    """подставляет данные пользователя"""
+    result = parse_agent.invoke({
+        "messages": [{"role": "user", "content": request}]});
+    return result["messages"][-1].text
+####################
 
-create_technical_tusk_agent = create_react_agent(
-    model=llm_giga,
-    tools=[],
-    prompt="Ты агент по созданию точных и четких технических тз по запросу пользователя",
-    name="technical_tusk_agent"
-)
+extraction_agent = create_extraction_agent(model=client)
 
-create_api_agent = create_react_agent(
-    model=llm_giga,
-    tools=[],
-    prompt="""Проанализируй предоставленный код API-метода и создай техническую документацию по следующей структуре.
-Структура документации:
+@tool
+def call_extraction_agent(request: str) -> str:
+    """Извлекает структурированные данные из указанного файла по описанию пользователя."""
+    try:
+        # request — JSON-строка вида: {"file_path": "...", "fields_description": "извлеки номер счёта отправителя и телефон"}
+        input_data = json.loads(request)
+        file_path = input_data.get("file_path")
+        fields_description = input_data.get("fields_description")
 
-1. Описание метода
-    Кратко опиши, что делает метод.
+        if not file_path or not fields_description:
+            return json.dumps({
+                "error": "Отсутствует file_path или fields_description"
+            }, ensure_ascii=False)
 
-2. HTTP-метод и URL
-    Укажи поддерживаемые HTTP-методы (GET/POST) и полный URL вызова.
+        resolved_path = str(Path(file_path).resolve())
+        if not os.path.exists(resolved_path):
+            return json.dumps({
+                "error": f"Файл не найден: {resolved_path}"
+            }, ensure_ascii=False)
 
-3. Параметры запроса
-    Оформи параметры в виде словаря, где ключ — имя параметра, а значение — словарь с полями: тип, обязательность, описание, пример значения.
+        if not os.access(resolved_path, os.R_OK):
+            return json.dumps({
+                "error": f"Нет прав на чтение файла: {resolved_path}"
+            }, ensure_ascii=False)
 
+        user_prompt = f"Файл: {resolved_path}\n\nЗадача: {fields_description}"
+        messages = [{"role": "user", "content": user_prompt}]
+        result = extraction_agent.invoke({"messages": messages})
+        last_message = result["messages"][-1]
+        raw_output = last_message.content if hasattr(last_message, 'content') else str(last_message)
 
-Пример:
-{
-"user_id": {
-"type": "int",
-"required": true,
-"description": "Идентификатор пользователя",
-"example": 123456
-},
-"fields": {
-"type": "string",
-"required": false,
-"description": "Список полей через запятую",
-"example": "first_name,last_name"
-},
-"access_token": {
-"type": "string",
-"required": true,
-"description": "Ключ доступа API",
-"example": "abcdef123456"
-},
-"v": {
-"type": "string",
-"required": true,
-"description": "Версия API",
-"example": "5.199"
-}
-}
+        # Пытаемся извлечь JSON
+        parsed = extract_json_from_text(raw_output)
 
-4. Пример запроса
-    Покажи пример запроса (GET или POST) с подстановкой реальных параметров.
+        # Если парсинг не удался — возвращаем ошибку
+        if not isinstance(parsed, dict):
+            return json.dumps({
+                "error": "Модель не вернула валидный JSON",
+                "raw_output": raw_output
+            }, ensure_ascii=False)
 
-5. Структура ответа
-    Опиши формат JSON-ответа, подробно объяснив поля.
+        # Убеждаемся, что результат — JSON-объект (не массив и не скаляр)
+        if not parsed:
+            return json.dumps({
+                "error": "Пустой или недействительный ответ от модели",
+                "raw_output": raw_output
+            }, ensure_ascii=False)
 
-6. Пример ответа
-    Приведи полный пример JSON-ответа.
+        return json.dumps(parsed, ensure_ascii=False)
 
-7. Ошибки
-    Опиши возможные коды ошибок в виде словаря:
+    except Exception as e:
+        return json.dumps({
+            "error": f"Критическая ошибка: {str(e)}",
+            "traceback": traceback.format_exc()
+        }, ensure_ascii=False)
 
+#####################
 
-Пример:
-{
-"5": {
-"description": "User not found"
-},
-"10": {
-"description": "Missing access token"
-}
-}
+supervisor_tools = [call_technical_task_agent, call_api_agent, call_parse_agent, call_extraction_agent]
 
-8. Замечания
-    Отметь особенности и рекомендации при использовании метода, если таковые есть.
+supervisor = create_supervisor(client, supervisor_tools)
 
+if __name__ == "__main__":
+    thread_id = uuid.uuid4()
+    while True:
+        user_input = input("\nПользователь: ")
+        if user_input.lower() in {"выход", "exit", "quit"}:
+            print("Диалог завершён.")
+            break
 
----
-
-Пример результата на основе Python-кода:
-
-def get_user_info(user_id: int, fields: list, access_token: str) -> dict:
-'''Получает данные пользователя по его ID'''
-url = "[https://api.example.com/users.get](https://api.example.com/users.get)"
-params = {'user_id': user_id, 'fields': ','.join(fields), 'access_token': access_token, 'v': '1.0'}
-response = requests.get(url, params=params)
-return response.json()
-
-Ожидаемый текст документации:
-
-get_user_info
-
-Описание метода
-Получает данные пользователя по идентификатору.
-
-HTTP-метод и URL
-GET [https://api.example.com/users.get](https://api.example.com/users.get)
-
-Параметры запроса
-{
-"user_id": {
-"type": "int",
-"required": true,
-"description": "Идентификатор пользователя",
-"example": 123456
-},
-"fields": {
-"type": "string",
-"required": false,
-"description": "Список полей через запятую",
-"example": "first_name,last_name"
-},
-"access_token": {
-"type": "string",
-"required": true,
-"description": "Ключ доступа API",
-"example": "..."
-},
-"v": {
-"type": "string",
-"required": true,
-"description": "Версия API",
-"example": "1.0"
-}
-}
-
-Пример запроса
-GET [https://api.example.com/users.get?user_id=123456&fields=first_name,last_name&access_token=...&v=1.0](https://api.example.com/users.get?user_id=123456&fields=first_name,last_name&access_token=...&v=1.0)
-
-Структура ответа
-Ответ содержит объект "response", который является списком объектов пользователей. Каждый объект содержит:
-
-- id (int) — идентификатор пользователя
-
-- first_name (string) — имя пользователя
-
-- last_name (string) — фамилия пользователя
-
-
-Пример ответа
-{
-"response": [
-{
-"id": 123456,
-"first_name": "Иван",
-"last_name": "Петров"
-}
-]
-}
-
-Ошибки
-{
-"5": {
-"description": "User not found"
-},
-"10": {
-"description": "Missing access token"
-}
-}
-
-Замечания
-Для передачи больших данных используйте POST с заголовком multipart/form-data. Возвращаемые поля зависят от параметра fields.",
-    name="api_agent""",
-    name="crete_api_agent"
-)
-
-
-supervisor = create_supervisor(
-    agents=[create_technical_tusk_agent, create_api_agent],
-    model=llm_giga,
-    prompt=supervisor_prompt
-)
-
-app = supervisor.compile()
-
-res = app.invoke(
-    {
-        "messages" : [
-            {
-                "role" : "user",
-                "content" : input()
+        # Добавляем сообщение пользователя в историю
+        # Вызываем агента с сохранением контекста по thread_id
+        config = {
+            "configurable": {
+                "thread_id": thread_id
             }
-        ]
-    }
-)
-for message in res["messages"]:
-    print(message.pretty_print())
-    print()
+        }
 
+        for step in supervisor.stream(
+                {"messages": [{"role": "user", "content": user_input}]},
+                config=config
+        ):
+            for update in step.values():
+                for message in update.get("messages", []):
+                    message.pretty_print()
