@@ -2,6 +2,7 @@ import os
 import dotenv
 import uuid
 import json
+from pathlib import Path  # <-- добавлено
 from langchain_openai import ChatOpenAI
 import re
 import traceback
@@ -15,18 +16,23 @@ from langchain.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
 from langgraph.checkpoint.memory import InMemorySaver
 
-dotenv.load_dotenv()
+dotenv.load_dotenv('doc_2025-11-22_13-44-09.env')
+api_key = os.getenv("API_KEY_GPT")
+if not api_key:
+    raise ValueError("API_KEY_GPT не найден в .env файле")
+
 client = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("API_KEY_GPT"),
-    model="openai/gpt-4o"
+    api_key=api_key,
+    model="x-ai/grok-4.1-fast:free",  # <-- бесплатная модель
 )
+
 ########
 technical_task_agent = create_technical_task(model=client)
 
 @tool
 def call_technical_task_agent(request: str) -> str:
-    """создает техническое задание по запросу пользователя"""# <-обязательно ,пояснение что делает инструмент, именно в таком формате
+    """создает техническое задание по запросу пользователя"""
     result = technical_task_agent.invoke({
         "messages": [{"role": "user", "content": request}]
     })
@@ -34,24 +40,42 @@ def call_technical_task_agent(request: str) -> str:
 ############
 
 api_agent = create_api_agent(model=client)
+
 @tool
-def call_api_agent(request : str) -> str:
-    """создает апи по запросу пользователя""" #<-обязательно ,пояснение что делает инструмент, именно в таком формате
+def call_api_agent(request: str) -> str:
+    """создает апи по запросу пользователя"""
     result = api_agent.invoke({
-        "messages": [{"role": "user", "content": request}]});
+        "messages": [{"role": "user", "content": request}]
+    })
     return result["messages"][-1].text
 #########
 
 parse_agent = create_agent(model=client)
+
 @tool
-def call_parse_agent(request : str) -> str:
+def call_parse_agent(request: str) -> str:
     """подставляет данные пользователя"""
     result = parse_agent.invoke({
-        "messages": [{"role": "user", "content": request}]});
+        "messages": [{"role": "user", "content": request}]
+    })
     return result["messages"][-1].text
 ####################
 
+# Инициализация extraction_agent
 extraction_agent = create_extraction_agent(model=client)
+
+# Вспомогательная функция для извлечения JSON (скопирована из вашего файла extraction_agent)
+def extract_json_from_text(text: str):
+    try:
+        text = re.sub(r"```(?:json)?", "", text).strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start == -1 or end == 0:
+            raise ValueError("No JSON-like structure found")
+        json_str = text[start:end]
+        return json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        return {}
 
 @tool
 def call_extraction_agent(request: str) -> str:
@@ -123,8 +147,6 @@ if __name__ == "__main__":
             print("Диалог завершён.")
             break
 
-        # Добавляем сообщение пользователя в историю
-        # Вызываем агента с сохранением контекста по thread_id
         config = {
             "configurable": {
                 "thread_id": thread_id
