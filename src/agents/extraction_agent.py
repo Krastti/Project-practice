@@ -65,8 +65,9 @@ def retrieve_document_content(file_path: str) -> str:
         return f"Ошибка при загрузке файла: {str(e)}"
 
 
-def extract_json_from_text(text: str) -> Dict[str, Any]:
-    """Пытается извлечь JSON из текста (включая случаи с обёрткой в ```json ... ```)."""
+@tool
+def extract_json_from_text(text: str):
+    """Вспомогательная функция для извлечения JSON"""
     try:
         text = re.sub(r"```(?:json)?", "", text).strip()
         start = text.find("{")
@@ -76,13 +77,12 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
         json_str = text[start:end]
         return json.loads(json_str)
     except (json.JSONDecodeError, ValueError):
-        # В случае ошибки парсинга — возвращаем пустой словарь, чтобы вызывающая функция обработала это как ошибку
         return {}
 
 
 # Создание инструментов (функций, помеченных @tool, которые принимают на вход str и возвращают str)
 def create_extraction_agent(model):
-    tools = [retrieve_document_content]
+    tools = [retrieve_document_content, extract_json_from_text]
     extraction_agent = create_agent(
         model=model,
         tools=tools,

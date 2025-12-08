@@ -4,19 +4,25 @@ import uuid
 import json
 from pathlib import Path  # <-- добавлено
 from langchain_openai import ChatOpenAI
-import re
 import traceback
 
+from pymongo.synchronous.database import Database
+from DataBase import TemplateDB
 from src.agents.create_api_agent import create_api_agent
 from src.agents.extraction_agent import create_extraction_agent
 from src.agents.supervisor import create_supervisor
-from src.agents.technical_task_agent import technical_task_agent_prompt, create_technical_task
+from src.agents.technical_task_agent import create_technical_task
 from langchain.agents import create_agent
 from langchain.tools import tool
-from langchain_community.tools import DuckDuckGoSearchRun
-from langgraph.checkpoint.memory import InMemorySaver
+from src.agents.extraction_agent import extract_json_from_text
+import re
+import subprocess
+import sys
+from typing import Optional
 
-dotenv.load_dotenv('doc_2025-11-22_13-44-09.env')
+index_scripts = 1
+
+dotenv.load_dotenv('.env')
 api_key = os.getenv("API_KEY_GPT")
 if not api_key:
     raise ValueError("API_KEY_GPT не найден в .env файле")
@@ -24,9 +30,9 @@ if not api_key:
 client = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=api_key,
-    model="x-ai/grok-4.1-fast:free",  # <-- бесплатная модель
+    model="kwaipilot/kat-coder-pro:free",  # <-- бесплатная модель
 )
-
+bd = TemplateDB()#создание бд
 ########
 technical_task_agent = create_technical_task(model=client)
 
@@ -49,8 +55,76 @@ def call_api_agent(request: str) -> str:
     })
     return result["messages"][-1].text
 #########
+@tool
+def run_python_code(filename : str) -> str:
+    """Запускает Python-файл через subprocess и возвращает результат работы файла в виде строки"""
+    try:
+        filename = "scripts/" + filename
+        # Запускаем файл через python (или python3)
+        result = subprocess.run(
+            [sys.executable, filename],  # sys.executable - текущий интерпретатор
+            capture_output=True,  # захватываем stdout и stderr
+            text=True,  # возвращаем строки, а не байты
+            timeout=30,# таймаут 30 секунд
+        )
 
-parse_agent = create_agent(model=client)
+        # Выводим результат
+
+        if result.stderr:
+            print("STDERR:", result.stderr)
+        print(f"Return code: {result.returncode}")
+        return result.stdout
+
+    except subprocess.TimeoutExpired:
+        print(f"Timeout: {filename} не завершился за 30 секунд")
+        return False
+    except FileNotFoundError:
+        print(f"Файл не найден: {filename}")
+        return False
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return False
+
+@tool
+def save_script(code: str, filename: Optional[str] = None) -> str:
+    """
+    Сохраняет Python код (строку) в файл .py.
+
+    Args:
+        code (str): Python код для сохранения
+        filename (str, optional): Имя файла. По умолчанию "temp_script.py"
+
+    Returns:
+        str: Путь к сохраненному файлу или сообщение об ошибке
+    """
+    try:
+        # Формируем имя файла
+        if filename is None:
+            index_scripts += 1
+        elif not filename.endswith('.py'):
+            filename += '.py'
+
+        script_dir = "scripts"
+        full_path = os.path.join(script_dir, filename)
+        # Сохраняем код в файл
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(code)
+        return full_path
+
+    except PermissionError:
+        return f"❌ Ошибка: Нет прав на запись в {script_dir}"
+    except Exception as e:
+        return f"❌ Ошибка сохранения: {str(e)}"
+
+
+@tool
+def search_in_bd(filename : str) -> str:
+    """поиск шаблона по названию в бд"""
+    return bd.get_template(filename)
+
+
+parse_agent_tools = [search_in_bd, run_python_code, save_script]
+parse_agent = create_agent(model=client, tools=parse_agent_tools)
 
 @tool
 def call_parse_agent(request: str) -> str:
@@ -64,8 +138,9 @@ def call_parse_agent(request: str) -> str:
 # Инициализация extraction_agent
 extraction_agent = create_extraction_agent(model=client)
 
-# Вспомогательная функция для извлечения JSON (скопирована из вашего файла extraction_agent)
+
 def extract_json_from_text(text: str):
+    """Вспомогательная функция для извлечения JSON"""
     try:
         text = re.sub(r"```(?:json)?", "", text).strip()
         start = text.find("{")
@@ -138,7 +213,6 @@ def call_extraction_agent(request: str) -> str:
 supervisor_tools = [call_technical_task_agent, call_api_agent, call_parse_agent, call_extraction_agent]
 
 supervisor = create_supervisor(client, supervisor_tools)
-
 if __name__ == "__main__":
     thread_id = uuid.uuid4()
     while True:
@@ -150,7 +224,7 @@ if __name__ == "__main__":
         config = {
             "configurable": {
                 "thread_id": thread_id
-            }
+            },
         }
 
         for step in supervisor.stream(
