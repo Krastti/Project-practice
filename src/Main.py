@@ -1,5 +1,6 @@
 import os
 import dotenv
+import logging
 import uuid
 import json
 from pathlib import Path
@@ -25,6 +26,14 @@ model_name = os.getenv("MODEL_NAME")
 if not api_key:
     raise ValueError("API_KEY_GPT не найден в .env файле")
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(name)s] - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("PP.log", encoding="utf-8"),
+    ],
+)
 
 client = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
