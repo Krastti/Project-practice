@@ -3,22 +3,26 @@ import dotenv
 import logging
 import uuid
 import json
-from pathlib import Path  # <-- добавлено
+from pathlib import Path
 from langchain_openai import ChatOpenAI
-import re
 import traceback
 
 from src.agents.create_api_agent import create_api_agent
 from src.agents.extraction_agent import create_extraction_agent
 from src.agents.supervisor import create_supervisor
-from src.agents.technical_task_agent import technical_task_agent_prompt, create_technical_task
+from src.agents.technical_task_agent import create_technical_task
 from langchain.agents import create_agent
 from langchain.tools import tool
-from langchain_community.tools import DuckDuckGoSearchRun
-from langgraph.checkpoint.memory import InMemorySaver
+import re
+import subprocess
+import sys
+from typing import Optional
 
-dotenv.load_dotenv('doc_2025-11-22_13-44-09.env')
+index_scripts = 1
+
+dotenv.load_dotenv('.env')
 api_key = os.getenv("API_KEY_GPT")
+model_name = os.getenv("MODEL_NAME")
 if not api_key:
     raise ValueError("API_KEY_GPT не найден в .env файле")
 
@@ -34,9 +38,8 @@ logging.basicConfig(
 client = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=api_key,
-    model="x-ai/grok-4.1-fast:free",  # <-- бесплатная модель
+    model=model_name# <-- бесплатная модель
 )
-
 ########
 technical_task_agent = create_technical_task(model=client)
 
@@ -59,8 +62,92 @@ def call_api_agent(request: str) -> str:
     })
     return result["messages"][-1].text
 #########
+@tool
+def run_python_code(filename: str) -> str:
+    """Запускает Python-файл через subprocess, возвращает результат и удаляет файл после выполнения"""
+    try:
+        # Запускаем файл через python (или python3)
+        result = subprocess.run(
+            [sys.executable, filename],  # sys.executable - текущий интерпретатор
+            capture_output=True,  # захватываем stdout и stderr
+            text=True,  # возвращаем строки, а не байты
+            timeout=30,  # таймаут 30 секунд
+        )
 
-parse_agent = create_agent(model=client)
+        # Сохраняем результат перед удалением
+        output = result.stdout
+
+        # Выводим информацию об ошибках если есть
+        if result.stderr:
+            print("STDERR:", result.stderr)
+        print(f"Return code: {result.returncode}")
+
+        # Удаляем файл после выполнения
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+                print(f"Файл удалён: {filename}")
+        except Exception as e:
+            print(f"Не удалось удалить файл {filename}: {e}")
+
+        return output
+
+    except subprocess.TimeoutExpired:
+        print(f"Timeout: {filename} не завершился за 30 секунд")
+        # Попытка удалить файл даже при таймауте
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+        except:
+            pass
+        return "Timeout error"
+    except FileNotFoundError:
+        print(f"Файл не найден: {filename}")
+        return "File not found"
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        # Попытка удалить файл даже при ошибке
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+        except:
+            pass
+        return f"Error: {str(e)}"
+
+
+@tool
+def save_script(code: str, filename: Optional[str] = None) -> str:
+    """
+    Сохраняет Python код (строку) в файл .py.
+
+    Args:
+        code (str): Python код для сохранения
+        filename (str, optional): Имя файла. По умолчанию "temp_script.py"
+
+    Returns:
+        str: Путь к сохраненному файлу или сообщение об ошибке
+    """
+    try:
+        # Формируем имя файла
+        if filename is None:
+            filename = "temp_script.py"
+        elif not filename.endswith('.py'):
+            filename += '.py'
+
+        script_dir = "scripts"
+        full_path = os.path.join(script_dir, filename)
+        # Сохраняем код в файл
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(code)
+        return full_path
+
+    except PermissionError:
+        return f"❌ Ошибка: Нет прав на запись в {script_dir}"
+    except Exception as e:
+        return f"❌ Ошибка сохранения: {str(e)}"
+
+parse_agent_tools = [run_python_code, save_script]
+parse_agent = create_agent(model=client, tools=parse_agent_tools)
 
 @tool
 def call_parse_agent(request: str) -> str:
@@ -74,28 +161,27 @@ def call_parse_agent(request: str) -> str:
 # Инициализация extraction_agent
 extraction_agent = create_extraction_agent(model=client)
 
-# Вспомогательная функция для извлечения JSON (скопирована из вашего файла extraction_agent)
-def extract_json_from_text(text: str):
+def extract_json_from_text(text: str) -> dict[str, any]:
+    """Пытается извлечь JSON из текста (включая случаи с обёрткой в ```json ... ``` или лишними словами)."""
     try:
+        # Удаляем markdown-обёртку
         text = re.sub(r"```(?:json)?", "", text).strip()
+        # Ищем начало и конец JSON
         start = text.find("{")
         end = text.rfind("}") + 1
         if start == -1 or end == 0:
             raise ValueError("No JSON-like structure found")
+
         json_str = text[start:end]
         return json.loads(json_str)
     except (json.JSONDecodeError, ValueError):
+        # Если не удалось распарсить — возвращаем пустой словарь
         return {}
 
 @tool
-def call_extraction_agent(request: str) -> str:
+def call_extraction_agent(file_path: str, fields_description: str) -> str:
     """Извлекает структурированные данные из указанного файла по описанию пользователя."""
     try:
-        # request — JSON-строка вида: {"file_path": "...", "fields_description": "извлеки номер счёта отправителя и телефон"}
-        input_data = json.loads(request)
-        file_path = input_data.get("file_path")
-        fields_description = input_data.get("fields_description")
-
         if not file_path or not fields_description:
             return json.dumps({
                 "error": "Отсутствует file_path или fields_description"
@@ -111,9 +197,13 @@ def call_extraction_agent(request: str) -> str:
             return json.dumps({
                 "error": f"Нет прав на чтение файла: {resolved_path}"
             }, ensure_ascii=False)
-
-        user_prompt = f"Файл: {resolved_path}\n\nЗадача: {fields_description}"
+        user_prompt = f"""
+        Ты — агент для извлечения данных. Верни ТОЛЬКО JSON с запрошенными полями.
+        Файл: {resolved_path}
+        Задача: {fields_description}
+        """
         messages = [{"role": "user", "content": user_prompt}]
+
         result = extraction_agent.invoke({"messages": messages})
         last_message = result["messages"][-1]
         raw_output = last_message.content if hasattr(last_message, 'content') else str(last_message)
@@ -142,13 +232,11 @@ def call_extraction_agent(request: str) -> str:
             "error": f"Критическая ошибка: {str(e)}",
             "traceback": traceback.format_exc()
         }, ensure_ascii=False)
-
 #####################
 
 supervisor_tools = [call_technical_task_agent, call_api_agent, call_parse_agent, call_extraction_agent]
 
 supervisor = create_supervisor(client, supervisor_tools)
-
 if __name__ == "__main__":
     thread_id = uuid.uuid4()
     while True:
@@ -160,7 +248,7 @@ if __name__ == "__main__":
         config = {
             "configurable": {
                 "thread_id": thread_id
-            }
+            },
         }
 
         for step in supervisor.stream(
