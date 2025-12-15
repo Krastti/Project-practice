@@ -1,5 +1,4 @@
 from langchain.agents import create_agent
-from langchain.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
 
 api_agent_prompt = """
@@ -31,15 +30,13 @@ api_agent_prompt = """
 
 Если пользователь запрашивает другой формат (например, Markdown, YAML или HTML), адаптируй вывод под указанный формат.
 """
-#создание инструментов(функций , помеченных @tool, которые принимают на вход str и возвращают str)
+
 tools = [DuckDuckGoSearchRun()]
+
 def create_api_agent(model):
     api_agent = create_agent(
         model=model,
         tools=tools,
-        system_prompt=api_agent_prompt,
+        system_prompt=api_agent_prompt
     )
     return api_agent
-#функция call_<ваш агент> тоже обязательно , через низ супервайзер взаймодействует с вашим агентом
-#сам агент ничего не печатает , у него недолжно быть метода main. Не должно быть методов, которые выполняют роль main.
-#Все методы либо @tool либо вызваются из @tool.

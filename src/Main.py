@@ -2,19 +2,16 @@ import os
 import dotenv
 import uuid
 import json
-from pathlib import Path  # <-- добавлено
+from pathlib import Path
 from langchain_openai import ChatOpenAI
 import traceback
 
-from pymongo.synchronous.database import Database
-from DataBase import TemplateDB
 from src.agents.create_api_agent import create_api_agent
 from src.agents.extraction_agent import create_extraction_agent
 from src.agents.supervisor import create_supervisor
 from src.agents.technical_task_agent import create_technical_task
 from langchain.agents import create_agent
 from langchain.tools import tool
-from src.agents.extraction_agent import extract_json_from_text
 import re
 import subprocess
 import sys
@@ -24,15 +21,16 @@ index_scripts = 1
 
 dotenv.load_dotenv('.env')
 api_key = os.getenv("API_KEY_GPT")
+model_name = os.getenv("MODEL_NAME")
 if not api_key:
     raise ValueError("API_KEY_GPT не найден в .env файле")
+
 
 client = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=api_key,
-    model="kwaipilot/kat-coder-pro:free",  # <-- бесплатная модель
+    model=model_name# <-- бесплатная модель
 )
-bd = TemplateDB()#создание бд
 ########
 technical_task_agent = create_technical_task(model=client)
 
@@ -56,34 +54,57 @@ def call_api_agent(request: str) -> str:
     return result["messages"][-1].text
 #########
 @tool
-def run_python_code(filename : str) -> str:
-    """Запускает Python-файл через subprocess и возвращает результат работы файла в виде строки"""
+def run_python_code(filename: str) -> str:
+    """Запускает Python-файл через subprocess, возвращает результат и удаляет файл после выполнения"""
     try:
-        filename = "scripts/" + filename
         # Запускаем файл через python (или python3)
         result = subprocess.run(
             [sys.executable, filename],  # sys.executable - текущий интерпретатор
             capture_output=True,  # захватываем stdout и stderr
             text=True,  # возвращаем строки, а не байты
-            timeout=30,# таймаут 30 секунд
+            timeout=30,  # таймаут 30 секунд
         )
 
-        # Выводим результат
+        # Сохраняем результат перед удалением
+        output = result.stdout
 
+        # Выводим информацию об ошибках если есть
         if result.stderr:
             print("STDERR:", result.stderr)
         print(f"Return code: {result.returncode}")
-        return result.stdout
+
+        # Удаляем файл после выполнения
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+                print(f"Файл удалён: {filename}")
+        except Exception as e:
+            print(f"Не удалось удалить файл {filename}: {e}")
+
+        return output
 
     except subprocess.TimeoutExpired:
         print(f"Timeout: {filename} не завершился за 30 секунд")
-        return False
+        # Попытка удалить файл даже при таймауте
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+        except:
+            pass
+        return "Timeout error"
     except FileNotFoundError:
         print(f"Файл не найден: {filename}")
-        return False
+        return "File not found"
     except Exception as e:
         print(f"Ошибка: {e}")
-        return False
+        # Попытка удалить файл даже при ошибке
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+        except:
+            pass
+        return f"Error: {str(e)}"
+
 
 @tool
 def save_script(code: str, filename: Optional[str] = None) -> str:
@@ -100,7 +121,7 @@ def save_script(code: str, filename: Optional[str] = None) -> str:
     try:
         # Формируем имя файла
         if filename is None:
-            index_scripts += 1
+            filename = "temp_script.py"
         elif not filename.endswith('.py'):
             filename += '.py'
 
@@ -116,14 +137,7 @@ def save_script(code: str, filename: Optional[str] = None) -> str:
     except Exception as e:
         return f"❌ Ошибка сохранения: {str(e)}"
 
-
-@tool
-def search_in_bd(filename : str) -> str:
-    """поиск шаблона по названию в бд"""
-    return bd.get_template(filename)
-
-
-parse_agent_tools = [search_in_bd, run_python_code, save_script]
+parse_agent_tools = [run_python_code, save_script]
 parse_agent = create_agent(model=client, tools=parse_agent_tools)
 
 @tool
@@ -138,29 +152,27 @@ def call_parse_agent(request: str) -> str:
 # Инициализация extraction_agent
 extraction_agent = create_extraction_agent(model=client)
 
-
-def extract_json_from_text(text: str):
-    """Вспомогательная функция для извлечения JSON"""
+def extract_json_from_text(text: str) -> dict[str, any]:
+    """Пытается извлечь JSON из текста (включая случаи с обёрткой в ```json ... ``` или лишними словами)."""
     try:
+        # Удаляем markdown-обёртку
         text = re.sub(r"```(?:json)?", "", text).strip()
+        # Ищем начало и конец JSON
         start = text.find("{")
         end = text.rfind("}") + 1
         if start == -1 or end == 0:
             raise ValueError("No JSON-like structure found")
+
         json_str = text[start:end]
         return json.loads(json_str)
     except (json.JSONDecodeError, ValueError):
+        # Если не удалось распарсить — возвращаем пустой словарь
         return {}
 
 @tool
-def call_extraction_agent(request: str) -> str:
+def call_extraction_agent(file_path: str, fields_description: str) -> str:
     """Извлекает структурированные данные из указанного файла по описанию пользователя."""
     try:
-        # request — JSON-строка вида: {"file_path": "...", "fields_description": "извлеки номер счёта отправителя и телефон"}
-        input_data = json.loads(request)
-        file_path = input_data.get("file_path")
-        fields_description = input_data.get("fields_description")
-
         if not file_path or not fields_description:
             return json.dumps({
                 "error": "Отсутствует file_path или fields_description"
@@ -176,9 +188,13 @@ def call_extraction_agent(request: str) -> str:
             return json.dumps({
                 "error": f"Нет прав на чтение файла: {resolved_path}"
             }, ensure_ascii=False)
-
-        user_prompt = f"Файл: {resolved_path}\n\nЗадача: {fields_description}"
+        user_prompt = f"""
+        Ты — агент для извлечения данных. Верни ТОЛЬКО JSON с запрошенными полями.
+        Файл: {resolved_path}
+        Задача: {fields_description}
+        """
         messages = [{"role": "user", "content": user_prompt}]
+
         result = extraction_agent.invoke({"messages": messages})
         last_message = result["messages"][-1]
         raw_output = last_message.content if hasattr(last_message, 'content') else str(last_message)
@@ -207,7 +223,6 @@ def call_extraction_agent(request: str) -> str:
             "error": f"Критическая ошибка: {str(e)}",
             "traceback": traceback.format_exc()
         }, ensure_ascii=False)
-
 #####################
 
 supervisor_tools = [call_technical_task_agent, call_api_agent, call_parse_agent, call_extraction_agent]
