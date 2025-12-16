@@ -31,9 +31,8 @@ api_agent_prompt = """
 Если пользователь запрашивает другой формат (например, Markdown, YAML или HTML), адаптируй вывод под указанный формат.
 """
 
-tools = [DuckDuckGoSearchRun()]
-
 def create_api_agent(model):
+    tools = [DuckDuckGoSearchRun()]
     api_agent = create_agent(
         model=model,
         tools=tools,

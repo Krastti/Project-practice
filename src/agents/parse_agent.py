@@ -62,7 +62,6 @@ print("✅ Файл сохранен: parsed_data_docx.docx")
 СГЕНЕРИРУЙ КОД СЕЙЧАС и следуй инструкциям!
 """
 
-
 def create_parse_agent(model, tools):
     parse_agent = create_agent(
         model=client,
@@ -70,4 +69,3 @@ def create_parse_agent(model, tools):
         system_prompt=parse_agent_prompt,
     )
     return parse_agent
-

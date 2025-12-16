@@ -39,16 +39,11 @@ technical_task_agent_prompt = """
 Если пользователь запрашивает другой формат (например, Markdown, YAML или HTML), адаптируй вывод под указанный формат.
 """
 
-# создание инструментов(функций , помеченных @tool, которые принимают на вход str и возвращают str)
-tools = []
-# создание агента
 def create_technical_task(model):
+    tools = [DuckDuckGoSearchRun()]
     technical_task_agent = create_agent(
-        model=model,  # model создавать не надо , я сам создам
-        tools=[DuckDuckGoSearchRun()],
+        model=model,
+        tools=tools,
         system_prompt=technical_task_agent_prompt,
     )
     return technical_task_agent
-# функция call_<ваш агент> тоже обязательно , через низ супервайзер взаймодействует с вашим агентом
-# сам агент ничего не печатает , у него недолжно быть метода main. Не должно быть методов, которые выполняют роль main.
-# Все методы либо @tool либо вызваются из @tool.
